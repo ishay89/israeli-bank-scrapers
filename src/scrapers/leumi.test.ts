@@ -1,4 +1,4 @@
-import LeumiScraper from './leumi';
+import LeumiScraper, { convertLeumiPortfolio } from './leumi';
 import { maybeTestCompanyAPI, extendAsyncTimeout, getTestsConfig, exportTransactions } from '../tests/tests-utils';
 import { SCRAPERS } from '../definitions';
 import { LoginResults } from './base-scraper-with-browser';
@@ -15,6 +15,58 @@ describe('Leumi legacy scraper', () => {
     expect(SCRAPERS.leumi).toBeDefined();
     expect(SCRAPERS.leumi.loginFields).toContain('username');
     expect(SCRAPERS.leumi.loginFields).toContain('password');
+  });
+
+  test('converts portfolio statement and holdings', () => {
+    const portfolio = convertLeumiPortfolio(
+      { PortfolioId: 'P-1', PFValue: 120000, PLShekel: 350, DailyChangePercent: 0.3 },
+      {
+        data: {
+          UserStatement: {
+            PortfolioIndex: 1,
+            PortfolioValue: 121000,
+            SumDailyProfit: 420,
+            DailyChangePercent: 0.35,
+            CurrencySymbol: '₪',
+            DataSource: [
+              {
+                PaperId: 42,
+                PaperName: 'Index fund',
+                Symbol: 'IDX',
+                Amount: 10,
+                Value: 121000,
+                Percent: 100,
+                ChangePercent: 0.5,
+              },
+            ],
+          },
+        },
+      },
+    );
+
+    expect(portfolio).toMatchObject({
+      sourceAccountNumber: 'P-1',
+      externalId: 'P-1',
+      currency: 'ILS',
+      totalValue: 121000,
+      dailyProfitLoss: 420,
+      dailyProfitLossPercent: 0.35,
+    });
+    expect(portfolio?.holdings[0]).toMatchObject({
+      externalId: '42',
+      name: 'Index fund',
+      symbol: 'IDX',
+      quantity: 10,
+      marketValue: 121000,
+      percentOfPortfolio: 100,
+      dailyChangePercent: 0.5,
+    });
+  });
+
+  test('returns null for an empty portfolio statement', () => {
+    expect(
+      convertLeumiPortfolio({ PortfolioId: 'P-1' }, { data: { UserStatement: { PortfolioValue: 0, DataSource: [] } } }),
+    ).toBeNull();
   });
 
   maybeTestCompanyAPI(COMPANY_ID, config => config.companyAPI.invalidPassword)(
