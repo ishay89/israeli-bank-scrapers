@@ -35,6 +35,51 @@ export interface FutureDebit {
   bankAccountNumber?: string;
 }
 
+export type DebtType = 'loan' | 'mortgage';
+
+/** A currently-active loan or mortgage track returned by a bank. */
+export interface DebtObligation {
+  sourceAccountNumber: string;
+  externalId: string;
+  type: DebtType;
+  name: string;
+  currency: string;
+  originalAmount?: number;
+  outstandingBalance?: number;
+  nextPaymentAmount?: number;
+  nextPaymentDate?: string;
+  currentMonthPayment?: number;
+  paymentsMade?: number;
+  paymentsRemaining?: number;
+  paymentsTotal?: number;
+  interestRate?: number;
+}
+
+export interface PortfolioHolding {
+  externalId: string;
+  name: string;
+  symbol?: string;
+  quantity?: number;
+  marketValue?: number;
+  currency: string;
+  percentOfPortfolio?: number;
+  dailyChangePercent?: number;
+  dailyProfitLoss?: number;
+}
+
+/** A securities portfolio and its current holdings. */
+export interface InvestmentPortfolio {
+  sourceAccountNumber: string;
+  externalId: string;
+  currency: string;
+  totalValue: number;
+  availableBalance?: number;
+  accountBalance?: number;
+  dailyProfitLoss?: number;
+  dailyProfitLossPercent?: number;
+  holdings: PortfolioHolding[];
+}
+
 interface ExternalBrowserOptions {
   /**
    * An externally created browser instance.
@@ -184,6 +229,8 @@ export interface ScraperScrapingResult {
   success: boolean;
   accounts?: TransactionsAccount[];
   futureDebits?: FutureDebit[];
+  debts?: DebtObligation[];
+  portfolios?: InvestmentPortfolio[];
   errorType?: ScraperErrorTypes;
   errorMessage?: string; // only on success=false
 }
