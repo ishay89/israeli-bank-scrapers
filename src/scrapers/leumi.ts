@@ -8,7 +8,12 @@ import { getRawTransaction } from '../helpers/transactions';
 import { waitForNavigation } from '../helpers/navigation';
 import { TransactionStatuses, TransactionTypes, type Transaction, type TransactionsAccount } from '../transactions';
 import { BaseScraperWithBrowser, LoginResults, type LoginOptions } from './base-scraper-with-browser';
-import { type ScraperOptions, type ScraperScrapingResult } from './interface';
+import {
+  type InvestmentPortfolio,
+  type PortfolioHolding,
+  type ScraperOptions,
+  type ScraperScrapingResult,
+} from './interface';
 
 const debug = getDebug('leumi');
 const BASE_URL = 'https://hb2.bankleumi.co.il';
@@ -16,6 +21,10 @@ const LOGIN_URL = 'https://www.leumi.co.il/he';
 const TRANSACTIONS_URL = `${BASE_URL}/eBanking/SO/SPA.aspx#/ts/BusinessAccountTrx?WidgetPar=1`;
 const FILTERED_TRANSACTIONS_URL = `${BASE_URL}/ChannelWCF/Broker.svc/ProcessRequest?moduleName=UC_SO_27_GetBusinessAccountTrx`;
 const SAVINGS_URL = `${BASE_URL}/uiapiproxy/v1/digital-retails/mobile/accounts/1/Deposits?operationList=true`;
+const PORTFOLIO_HOME_URL = `${BASE_URL}/lti/lti-app/home`;
+const PORTFOLIO_STATUS_URL = `${BASE_URL}/lti/lti-app/trade/portfolio/status`;
+const PORTFOLIO_SUMMARY_API_PATH = '/lti/lti-app/api/Trade/RikuzTikim';
+const PORTFOLIO_STATEMENT_API_PATH = '/lti/lti-app/api/Trade/Statement';
 
 const DATE_FORMAT = 'DD.MM.YY';
 const ACCOUNT_BLOCKED_MSG = 'המנוי חסום';
@@ -56,6 +65,100 @@ interface SavingsAccountData {
   depositsAndSavingsItems: SavingsDepositItem[];
   operationsItemsTotal: string;
   operationsListItems: any[];
+}
+
+type BankRecord = Record<string, unknown>;
+
+function numberValue(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === '') return undefined;
+  if (typeof value !== 'number' && typeof value !== 'string') return undefined;
+  const parsed = typeof value === 'number' ? value : Number(value.replace(/,/g, ''));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function textValue(value: unknown, fallback = ''): string {
+  if (typeof value !== 'string' && typeof value !== 'number') return fallback;
+  return `${value}`.trim();
+}
+
+function asRecords(value: unknown): BankRecord[] {
+  if (Array.isArray(value)) return value as BankRecord[];
+  return value && typeof value === 'object' ? [value as BankRecord] : [];
+}
+
+function currencyCode(symbol: unknown): string {
+  const value = textValue(symbol);
+  if (value === '$') return 'USD';
+  if (value === '€') return 'EUR';
+  if (value === '£') return 'GBP';
+  return 'ILS';
+}
+
+export function convertLeumiPortfolio(summary: BankRecord, statementPayload: unknown): InvestmentPortfolio | null {
+  const statement = (statementPayload as { data?: { UserStatement?: BankRecord } })?.data?.UserStatement;
+  if (!statement) return null;
+
+  const totalValue = numberValue(statement.PortfolioValue ?? summary.PFValue) ?? 0;
+  const securities = asRecords(statement.DataSource);
+  if (totalValue === 0 && securities.length === 0) return null;
+
+  const portfolioId = textValue(summary.PortfolioId, textValue(statement.PortfolioIndex, 'portfolio'));
+  const currency = currencyCode(statement.CurrencySymbol);
+  const holdings: PortfolioHolding[] = securities.map((security, index) => ({
+    externalId: textValue(security.PaperId, `${textValue(security.Symbol, 'security')}-${index}`),
+    name: textValue(security.PaperName, textValue(security.Symbol, 'Security')),
+    symbol: textValue(security.Symbol) || undefined,
+    quantity: numberValue(security.Amount),
+    marketValue: numberValue(security.Value),
+    currency,
+    percentOfPortfolio: numberValue(security.Percent),
+    dailyChangePercent: numberValue(security.ChangePercent),
+  }));
+
+  return {
+    // A Leumi securities portfolio is a distinct account and does not match the
+    // checking-account numbers returned by the transactions scraper.
+    sourceAccountNumber: portfolioId,
+    externalId: portfolioId,
+    currency,
+    totalValue,
+    dailyProfitLoss: numberValue(statement.SumDailyProfit ?? summary.PLShekel),
+    dailyProfitLossPercent: numberValue(statement.DailyChangePercent ?? summary.DailyChangePercent),
+    holdings,
+  };
+}
+
+async function fetchLeumiPortfolios(page: Page): Promise<InvestmentPortfolio[]> {
+  const summaryResponsePromise = page.waitForResponse(response => response.url().includes(PORTFOLIO_SUMMARY_API_PATH));
+  await page.goto(PORTFOLIO_STATUS_URL, { waitUntil: 'domcontentloaded' });
+  const summaryResponse = await summaryResponsePromise;
+  const summaryPayload = (await summaryResponse.json()) as { data?: { records?: unknown } };
+  const summaries = asRecords(summaryPayload?.data?.records);
+  if (summaries.length === 0) return [];
+
+  const statementResponsePromise = page.waitForResponse(response =>
+    response.url().includes(PORTFOLIO_STATEMENT_API_PATH),
+  );
+  await page.goto(PORTFOLIO_HOME_URL, { waitUntil: 'domcontentloaded' });
+  const firstStatementResponse = await statementResponsePromise;
+  const firstStatement = (await firstStatementResponse.json()) as unknown;
+  const firstStatementIndex = numberValue(
+    (firstStatement as { data?: { UserStatement?: BankRecord } })?.data?.UserStatement?.PortfolioIndex,
+  );
+  const statementUrl = new URL(firstStatementResponse.url());
+
+  const portfolios: InvestmentPortfolio[] = [];
+  for (const summary of summaries) {
+    const portfolioIndex = numberValue(summary.PortfolioIndex);
+    let statement = firstStatement;
+    if (portfolioIndex !== firstStatementIndex) {
+      statementUrl.searchParams.set('PortfolioIndex', String(portfolioIndex ?? 0));
+      statement = await fetchGetWithinPage(page, statementUrl.toString());
+    }
+    const portfolio = convertLeumiPortfolio(summary, statement);
+    if (portfolio) portfolios.push(portfolio);
+  }
+  return portfolios;
 }
 
 function getPossibleLoginResults() {
@@ -358,9 +461,19 @@ class LeumiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
     const savingsAccounts = await fetchSavingsAccounts(this.page, accounts);
     accounts.push(...savingsAccounts);
 
+    let portfolios: InvestmentPortfolio[] | undefined;
+    try {
+      portfolios = await fetchLeumiPortfolios(this.page);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      debug(`failed to fetch portfolios: ${message.split(', result:')[0]}`);
+      portfolios = undefined;
+    }
+
     return {
       success: true,
       accounts,
+      portfolios,
     };
   }
 }
