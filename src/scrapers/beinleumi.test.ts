@@ -1,4 +1,4 @@
-import BeinleumiScraper from './beinleumi';
+import BeinleumiScraper, { convertBeinleumiPortfolio } from './beinleumi';
 import { maybeTestCompanyAPI, extendAsyncTimeout, getTestsConfig, exportTransactions } from '../tests/tests-utils';
 import { SCRAPERS } from '../definitions';
 import { LoginResults } from './base-scraper-with-browser';
@@ -15,6 +15,68 @@ describe('Beinleumi', () => {
     expect(SCRAPERS.beinleumi).toBeDefined();
     expect(SCRAPERS.beinleumi.loginFields).toContain('username');
     expect(SCRAPERS.beinleumi.loginFields).toContain('password');
+  });
+
+  test('converts portfolio summary and paginated holdings', () => {
+    const portfolio = convertBeinleumiPortfolio(
+      {
+        portfolioValue: 150000,
+        tradeBalance: 5000,
+        dailyAmountChange: -250,
+        dailyPercentageChange: -0.16,
+        currencyISOCode: 'ILS',
+      },
+      [
+        {
+          pagedResult: {
+            results: [
+              {
+                number: '42',
+                name: 'Index fund',
+                symbol: 'IDX',
+                amount: 10,
+                holdingValue: 149000,
+                holdingValueInNis: 150000,
+                portfolioPercentage: 100,
+                percentDailyChange: -0.2,
+              },
+            ],
+          },
+        },
+        {
+          pagedResult: {
+            // Repeated boundary rows from pagination must not create duplicate
+            // natural keys in the Supabase holdings upsert batch.
+            results: [{ number: '42', name: 'Index fund', holdingValueInNis: 150000 }],
+          },
+        },
+      ],
+      '123_456',
+    );
+
+    expect(portfolio).toMatchObject({
+      sourceAccountNumber: '123_456',
+      externalId: '123_456:securities',
+      currency: 'ILS',
+      totalValue: 150000,
+      availableBalance: 5000,
+      dailyProfitLoss: -250,
+      dailyProfitLossPercent: -0.16,
+    });
+    expect(portfolio?.holdings[0]).toMatchObject({
+      externalId: '42',
+      name: 'Index fund',
+      symbol: 'IDX',
+      quantity: 10,
+      marketValue: 150000,
+      percentOfPortfolio: 100,
+      dailyChangePercent: -0.2,
+    });
+    expect(portfolio?.holdings).toHaveLength(1);
+  });
+
+  test('returns null for an empty portfolio', () => {
+    expect(convertBeinleumiPortfolio({ portfolioValue: 0 }, [{ pagedResult: { results: [] } }], '123')).toBeNull();
   });
 
   maybeTestCompanyAPI(COMPANY_ID, config => config.companyAPI.invalidPassword)(
