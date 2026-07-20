@@ -2,7 +2,6 @@ import moment from 'moment';
 import { type HTTPRequest, type Frame, type Page } from 'puppeteer';
 import { getDebug } from '../helpers/debug';
 import { clickButton, elementPresentOnPage, pageEval, waitUntilElementFound } from '../helpers/elements-interactions';
-import { fetchPost } from '../helpers/fetch';
 import { getCurrentUrl, waitForNavigation } from '../helpers/navigation';
 import { getFromSessionStorage } from '../helpers/storage';
 import { filterOldTransactions, getRawTransaction } from '../helpers/transactions';
@@ -464,6 +463,54 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     return Promise.resolve('09031987-273E-2311-906C-8AF85B17C8D9');
   }
 
+  private async fetchApi<TResult>(
+    url: string,
+    data: Record<string, unknown>,
+    Authorization: string,
+    xSiteId: string,
+  ): Promise<TResult> {
+    const [responseText, status, contentType] = await this.page.evaluate(
+      async (
+        innerUrl: string,
+        innerData: Record<string, unknown>,
+        innerAuthorization: string,
+        innerXSiteId: string,
+      ) => {
+        const response = await fetch(innerUrl, {
+          method: 'POST',
+          body: JSON.stringify(innerData),
+          credentials: 'include',
+          headers: {
+            Accept: 'application/json',
+            Authorization: innerAuthorization,
+            'Content-Type': 'application/json',
+            'X-Site-Id': innerXSiteId,
+          },
+        });
+
+        return [await response.text(), response.status, response.headers.get('content-type')] as const;
+      },
+      url,
+      data,
+      Authorization,
+      xSiteId,
+    );
+
+    const endpoint = new URL(url).pathname;
+    if (status !== 200) {
+      throw new Error(`Cal API returned HTTP ${status} for ${endpoint}`);
+    }
+    if (!contentType?.toLowerCase().includes('application/json')) {
+      throw new Error(`Cal API returned a non-JSON response for ${endpoint}`);
+    }
+
+    try {
+      return JSON.parse(responseText) as TResult;
+    } catch {
+      throw new Error(`Cal API returned invalid JSON for ${endpoint}`);
+    }
+  }
+
   getLoginOptions(credentials: ScraperSpecificCredentials): LoginOptions {
     this.authRequestPromise = this.page
       .waitForRequest(SSO_AUTHORIZATION_REQUEST_ENDPOINT, { timeout: 10_000 })
@@ -508,15 +555,11 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     xSiteId: string,
   ): Promise<TransactionsAccount> {
     debug('fetch frames (misgarot) for card %s', card.cardUniqueId);
-    const frames = await fetchPost<FramesResponse>(
+    const frames = await this.fetchApi<FramesResponse>(
       FRAMES_REQUEST_ENDPOINT,
       { cardsForFrameData: [{ cardUniqueId: card.cardUniqueId }] },
-      {
-        Authorization,
-        'X-Site-Id': xSiteId,
-        'Content-Type': 'application/json',
-        ...apiHeaders,
-      },
+      Authorization,
+      xSiteId,
     );
 
     debug('frames response for card %s: %O', card.cardUniqueId, frames);
@@ -554,29 +597,18 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     const allMonthsData: CardTransactionDetails[] = [];
 
     debug(`fetch pending transactions for card ${card.cardUniqueId}`);
-    let pendingData = await fetchPost(
-      PENDING_TRANSACTIONS_REQUEST_ENDPOINT,
-      { cardUniqueIDArray: [card.cardUniqueId] },
-      {
-        Authorization,
-        'X-Site-Id': xSiteId,
-        'Content-Type': 'application/json',
-        ...apiHeaders,
-      },
-    );
+    let pendingData: CardPendingTransactionDetails | CardTransactionDetailsError | null = await this.fetchApi<
+      CardPendingTransactionDetails | CardTransactionDetailsError
+    >(PENDING_TRANSACTIONS_REQUEST_ENDPOINT, { cardUniqueIDArray: [card.cardUniqueId] }, Authorization, xSiteId);
 
     debug(`fetch completed transactions for card ${card.cardUniqueId}`);
     for (let i = 0; i <= months; i++) {
       const month = finalMonthToFetchMoment.clone().subtract(i, 'months');
-      const monthData = await fetchPost(
+      const monthData = await this.fetchApi<CardTransactionDetails | CardTransactionDetailsError>(
         TRANSACTIONS_REQUEST_ENDPOINT,
         { cardUniqueId: card.cardUniqueId, month: month.format('M'), year: month.format('YYYY') },
-        {
-          Authorization,
-          'X-Site-Id': xSiteId,
-          'Content-Type': 'application/json',
-          ...apiHeaders,
-        },
+        Authorization,
+        xSiteId,
       );
 
       if (monthData?.statusCode !== 1)
