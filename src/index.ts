@@ -2,7 +2,7 @@ export { CompanyTypes, SCRAPERS } from './definitions';
 export { default as createScraper } from './scrapers/factory';
 
 // Note: the typo ScaperScrapingResult & ScraperLoginResult (sic) are exported here for backward compatibility
-export {
+export type {
   ScraperLoginResult as ScaperLoginResult,
   ScraperScrapingResult as ScaperScrapingResult,
   Scraper,
