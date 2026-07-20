@@ -33,6 +33,8 @@ const PENDING_TRANSACTIONS_TABLE = 'table#dataTable023';
 const NEXT_PAGE_LINK = 'a#Npage.paging';
 const CURRENT_BALANCE = '.main_balance';
 const IFRAME_NAME = 'iframe-old-pages';
+const CHANGE_PASSWORD_FORM = '#ChangePswform';
+const LOGIN_SUBMIT_BUTTON = '#continueBtn';
 const ELEMENT_RENDER_TIMEOUT_MS = 10000;
 
 type TransactionsColsTypes = Record<string, number>;
@@ -49,6 +51,20 @@ interface ScrapedTransaction {
   status: TransactionStatuses;
 }
 
+async function isChangePasswordFormShown(page: Page): Promise<boolean> {
+  return page
+    .$eval(CHANGE_PASSWORD_FORM, el => {
+      const element = el as HTMLElement;
+      const style = window.getComputedStyle(element);
+      return (
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        (element.offsetWidth > 0 || element.offsetHeight > 0)
+      );
+    })
+    .catch(() => false);
+}
+
 export function getPossibleLoginResults(): PossibleLoginResults {
   const urls: PossibleLoginResults = {};
   urls[LoginResults.Success] = [
@@ -57,6 +73,11 @@ export function getPossibleLoginResults(): PossibleLoginResults {
     /FibiMenu\/Online/, // Old UI pattern
   ];
   urls[LoginResults.InvalidPassword] = [/FibiMenu\/Marketing\/Private\/Home/];
+  // The password-expired page stays on the login servlet URL, so it can only be
+  // detected by the visible change-password form, not by a URL pattern.
+  urls[LoginResults.ChangePassword] = [
+    async options => (options?.page ? isChangePasswordFormShown(options.page) : false),
+  ];
   return urls;
 }
 
@@ -317,7 +338,33 @@ export async function waitForPostLogin(page: Page) {
     waitUntilElementFound(page, '#account_num', true), // New UI
     waitUntilElementFound(page, '#matafLogoutLink', true), // Old UI
     waitUntilElementFound(page, '#validationMsg', true), // Old UI
+    waitUntilElementFound(page, CHANGE_PASSWORD_FORM, true), // Password expired page
   ]);
+}
+
+export async function waitForLoginReadiness(page: Page): Promise<void> {
+  const state = await Promise.race([
+    waitUntilElementFound(page, LOGIN_SUBMIT_BUTTON, true).then(() => 'ready' as const),
+    page
+      .waitForFunction(
+        () =>
+          /radware/i.test(document.title) ||
+          window.location.hostname === 'validate.perfdrive.com' ||
+          /verifying your browser before proceeding/i.test(document.body?.innerText ?? ''),
+      )
+      .then(() => 'radware' as const),
+  ]);
+
+  if (state === 'radware') {
+    const pageState = await page.evaluate(() => ({
+      title: document.title,
+      hostname: window.location.hostname,
+      pathname: window.location.pathname,
+    }));
+    throw new Error(
+      `Beinleumi login blocked by Radware Bot Manager (${pageState.title || 'challenge'} at ${pageState.hostname}${pageState.pathname})`,
+    );
+  }
 }
 
 async function fetchAccountData(page: Page | Frame, startDate: Moment, options?: ScraperOptions) {
@@ -513,7 +560,8 @@ class BeinleumiGroupBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCr
     return {
       loginUrl: `${this.LOGIN_URL}`,
       fields: createLoginFields(credentials),
-      submitButtonSelector: '#continueBtn',
+      submitButtonSelector: LOGIN_SUBMIT_BUTTON,
+      checkReadiness: async () => waitForLoginReadiness(this.page),
       postAction: async () => waitForPostLogin(this.page),
       possibleResults: getPossibleLoginResults(),
       // HACK: For some reason, though the login button (#continueBtn) is present and visible, the click action does not perform.
