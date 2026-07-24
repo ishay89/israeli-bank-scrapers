@@ -7,6 +7,13 @@ export interface TransactionsAccount {
   currency?: string;
   savingsAccount?: boolean;
   txns: Transaction[];
+  /**
+   * The Isracard-group issuer company code this card belongs to (e.g. 11 = Isracard, 77 = Amex).
+   * Set when a single login surfaces cards from more than one issuer — the Isracard login also
+   * exposes American Express cards through the DigitalV3 web API — so a consumer can attribute
+   * each card to the correct company. Absent for scrapers where one login maps to one company.
+   */
+  companyCode?: number;
 }
 
 export enum CardType {
