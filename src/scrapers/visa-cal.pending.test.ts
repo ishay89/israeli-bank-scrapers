@@ -58,6 +58,28 @@ function dataFixture(transactions: unknown[]) {
   ] as any;
 }
 
+// Like `dataFixture` but with real billing dates on each debit-date bucket, mirroring the
+// `debitDates[].date` the Cal API returns. Used to prove the next-debit date can be recovered
+// from the card's own schedule when the frames endpoint supplies none.
+function dataFixtureWithSchedule(debitDates: { date: string; transactions?: unknown[] }[]) {
+  return [
+    {
+      result: {
+        bankAccounts: [
+          {
+            debitDates: debitDates.map(d => ({ date: d.date, transactions: d.transactions ?? [] })),
+            immidiateDebits: { totalDebits: [], debitDays: [] },
+          },
+        ],
+        blockedCardInd: false,
+      },
+      statusCode: 1,
+      statusDescription: '',
+      statusTitle: '',
+    },
+  ] as any;
+}
+
 function pendingDataFixture(transactions: unknown[]) {
   return {
     result: { cardsList: [{ cardUniqueID: 'card-1', authDetalisList: transactions }] },
@@ -94,6 +116,51 @@ describe('convertParsedDataToTransactions - pending transaction billing date', (
 
     const pending = result.find(t => t.status === TransactionStatuses.Pending);
     expect(pending?.processedDate).toBe(pending?.date);
+  });
+
+  test('derives the next-debit date from the card own billing schedule when the frames endpoint supplies none', () => {
+    // Some cards' frames responses carry no nextDebitDate and no nextTotalDebitDateForAccount, so
+    // the caller passes undefined. The card's own completed data still carries its billing schedule
+    // in debitDates[].date - the earliest date on or after the purchase (2026-07-26) is the cycle
+    // the pending charge will actually post in.
+    const result = convertParsedDataToTransactions(
+      dataFixtureWithSchedule([
+        { date: '2026-07-02T00:00:00' }, // last cycle, already billed - before the purchase
+        { date: '2026-08-02T00:00:00' }, // next cycle - the real next debit date
+      ]),
+      pendingDataFixture([pendingTransaction()]),
+      undefined,
+      undefined,
+    );
+
+    const pending = result.find(t => t.status === TransactionStatuses.Pending);
+    expect(pending).toBeDefined();
+    expect(pending!.processedDate).toBe(new Date('2026-08-02T00:00:00').toISOString());
+    expect(pending!.processedDate).not.toBe(pending!.date);
+  });
+
+  test('a passed next-debit date still wins over the derived schedule date', () => {
+    const result = convertParsedDataToTransactions(
+      dataFixtureWithSchedule([{ date: '2026-09-02T00:00:00' }]),
+      pendingDataFixture([pendingTransaction()]),
+      undefined,
+      '2026-08-02T00:00:00',
+    );
+
+    const pending = result.find(t => t.status === TransactionStatuses.Pending);
+    expect(pending!.processedDate).toBe(new Date('2026-08-02T00:00:00').toISOString());
+  });
+
+  test('falls back to the purchase date when every scheduled debit date is before the purchase', () => {
+    const result = convertParsedDataToTransactions(
+      dataFixtureWithSchedule([{ date: '2026-06-02T00:00:00' }, { date: '2026-07-02T00:00:00' }]),
+      pendingDataFixture([pendingTransaction()]), // purchased 2026-07-26, after every scheduled date
+      undefined,
+      undefined,
+    );
+
+    const pending = result.find(t => t.status === TransactionStatuses.Pending);
+    expect(pending!.processedDate).toBe(pending!.date);
   });
 
   test('a pending and a completed transaction for the same cycle land on the same processed date', () => {
