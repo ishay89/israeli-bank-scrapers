@@ -33,7 +33,9 @@ const WEB_BASE = 'https://web.isracard.co.il';
 const TRANSACTIONS_PAGE = `${WEB_BASE}/transactions`;
 const TRANSACTIONS_LIST_URL = `${WEB_BASE}/ocp/transactions/DigitalV3.Transactions/GetTransactionsList`;
 // The card roster the SPA loads on the transactions page: `data.cardsList[]`, each entry carrying
-// `cardSuffix` + `companyCode` (as a numeric string, e.g. "77") + `cardStatus`.
+// `cardSuffix` + `companyCode` (as a numeric string, e.g. "77") + `cardStatus`, plus a
+// `cardChargeNext`/`cardChargeLast` block (`{ billingDate: "02/08/2026", ... }`) with the card's
+// real billing-cycle day — used for `processedDate` instead of assuming the 1st of the month.
 const CARD_LIST_MARKER = 'GetCardList';
 
 export const AMEX_COMPANY_CODE = 77;
@@ -58,6 +60,9 @@ interface DigitalCard {
   cardSuffix: string;
   companyCode: number;
   cardStatus: number;
+  /** Day-of-month (1-31) the card's billing cycle charges on, e.g. 2. Null when the roster didn't
+   *  carry a `cardChargeNext`/`cardChargeLast` block to read it from. */
+  billingDay: number | null;
 }
 
 /** Coerces a value that may be a number or a numeric string to a number, else null. */
@@ -71,9 +76,28 @@ function toNumber(value: unknown): number | null {
   return null;
 }
 
+/** Extracts the day-of-month from a `DD/MM/YYYY` string, or null if missing/unparseable. */
+function parseDayOfMonth(dateStr: unknown): number | null {
+  if (typeof dateStr !== 'string') {
+    return null;
+  }
+  const day = parseInt(dateStr.split('/')[0] ?? '', 10);
+  return Number.isFinite(day) && day >= 1 && day <= 31 ? day : null;
+}
+
+/** Reads the real billing day-of-month off a roster card entry's `cardChargeNext`/`cardChargeLast`
+ *  blocks (e.g. `{ billingDate: "02/08/2026" }`), preferring the upcoming cycle. Both blocks report
+ *  the same fixed cycle day in practice, so either is a reliable stand-in for months without their
+ *  own block. */
+function readBillingDay(obj: Record<string, unknown>): number | null {
+  const next = obj.cardChargeNext as Record<string, unknown> | undefined;
+  const last = obj.cardChargeLast as Record<string, unknown> | undefined;
+  return parseDayOfMonth(next?.billingDate) ?? parseDayOfMonth(last?.billingDate);
+}
+
 /** Depth-first scan for card-identity objects anywhere in the roster response. Company code and
  *  status may arrive as numbers or numeric strings, so both are coerced. */
-function collectCards(node: unknown, out: DigitalCard[] = []): DigitalCard[] {
+export function collectCards(node: unknown, out: DigitalCard[] = []): DigitalCard[] {
   if (Array.isArray(node)) {
     node.forEach(child => collectCards(child, out));
     return out;
@@ -87,6 +111,7 @@ function collectCards(node: unknown, out: DigitalCard[] = []): DigitalCard[] {
         cardSuffix: String(suffix),
         companyCode,
         cardStatus: toNumber(obj.cardStatus) ?? 0,
+        billingDay: readBillingDay(obj),
       });
     }
     Object.values(obj).forEach(value => collectCards(value, out));
@@ -120,13 +145,26 @@ function normalizeCurrency(currency?: string): string {
   return currency;
 }
 
+/** Resolves the billing month cursor to the card's real charge date: `billingDay` when known
+ *  (clamped to the month's last day, e.g. a "31" cycle day in February), else the 1st of the
+ *  month as a last-resort fallback for cards the roster gave no billing-date block for. */
+export function resolveProcessedMoment(monthMoment: Moment, billingDay: number | null): Moment {
+  if (!billingDay) {
+    return monthMoment.clone().date(1);
+  }
+  const day = Math.min(billingDay, monthMoment.daysInMonth());
+  return monthMoment.clone().date(day);
+}
+
 /**
  * Maps one DigitalV3 voucher to the shared `Transaction` shape, mirroring the legacy
  * Isracard/Amex mapping: amounts are negated (outflows are negative), `date` is the purchase
  * date (matching what the bank UI shows), `chargedAmount` is the amount billed this cycle while
  * `originalAmount` is the full deal amount, and installments are parsed from the Hebrew memo.
+ * `processedMoment` is the card's real charge date for this billing cycle (see
+ * `resolveProcessedMoment`), not just the 1st of the billing month.
  */
-export function voucherToTransaction(voucher: DigitalVoucher, billingMoment: Moment): Transaction | null {
+export function voucherToTransaction(voucher: DigitalVoucher, processedMoment: Moment): Transaction | null {
   if (!voucher.purchaseDate) {
     return null;
   }
@@ -137,7 +175,7 @@ export function voucherToTransaction(voucher: DigitalVoucher, billingMoment: Mom
     type: installments ? TransactionTypes.Installments : TransactionTypes.Normal,
     identifier: voucher.voucherNumber,
     date: moment(voucher.purchaseDate, 'DD/MM/YYYY').toISOString(),
-    processedDate: billingMoment.clone().date(1).toISOString(),
+    processedDate: processedMoment.clone().toISOString(),
     originalAmount: -original,
     originalCurrency: normalizeCurrency(voucher.originalCurrencyIso ?? voucher.originalCurrency),
     chargedAmount: -billed,
@@ -165,8 +203,9 @@ async function fetchCardMonth(page: Page, card: DigitalCard, monthMoment: Moment
   }>(page, TRANSACTIONS_LIST_URL, body, { 'Content-Type': 'application/json' }, true);
 
   const vouchers = result?.data?.israelAbroadVouchers?.vouchers?.israelAbroadVouchersList ?? [];
+  const processedMoment = resolveProcessedMoment(monthMoment, card.billingDay);
   return vouchers
-    .map(voucher => voucherToTransaction(voucher, monthMoment))
+    .map(voucher => voucherToTransaction(voucher, processedMoment))
     .filter((txn): txn is Transaction => txn !== null);
 }
 

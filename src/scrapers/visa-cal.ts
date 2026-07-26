@@ -350,10 +350,11 @@ function createLoginFields(credentials: ScraperSpecificCredentials) {
   ];
 }
 
-function convertParsedDataToTransactions(
+export function convertParsedDataToTransactions(
   data: CardTransactionDetails[],
   pendingData?: CardPendingTransactionDetails | null,
   options?: ScraperOptions,
+  nextDebitDate?: string | null,
 ): Transaction[] {
   const pendingTransactions = pendingData?.result
     ? pendingData.result.cardsList.flatMap(card => card.authDetalisList)
@@ -367,6 +368,12 @@ function convertParsedDataToTransactions(
   );
 
   const all: (ScrapedTransaction | ScrapedPendingTransaction)[] = [...pendingTransactions, ...completedTransactions];
+
+  // A pending/in-clearance transaction (`בקליטה`) hasn't been assigned to a billing cycle yet, so
+  // the API gives it no debit date of its own. Bill it on the account's real next debit date - the
+  // same cycle its amount is already folded into - rather than its purchase date, which would
+  // otherwise mint a separate, spurious forecast event on the purchase day.
+  const nextDebitMoment = nextDebitDate ? moment(nextDebitDate) : null;
 
   return all.map(transaction => {
     const numOfPayments = isPending(transaction) ? transaction.numberOfPayments : transaction.numOfPayments;
@@ -389,7 +396,9 @@ function convertParsedDataToTransactions(
         : TransactionTypes.Installments,
       status: isPending(transaction) ? TransactionStatuses.Pending : TransactionStatuses.Completed,
       date: installments ? date.add(installments.number - 1, 'month').toISOString() : date.toISOString(),
-      processedDate: isPending(transaction) ? date.toISOString() : new Date(transaction.debCrdDate).toISOString(),
+      processedDate: isPending(transaction)
+        ? (nextDebitMoment ?? date).toISOString()
+        : new Date(transaction.debCrdDate).toISOString(),
       originalAmount,
       originalCurrency: transaction.trnCurrencySymbol,
       chargedAmount,
@@ -656,7 +665,7 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       pendingData = null;
     }
 
-    const transactions = convertParsedDataToTransactions(allMonthsData, pendingData, this.options);
+    const transactions = convertParsedDataToTransactions(allMonthsData, pendingData, this.options, balanceDate);
 
     debug('filter out old transactions');
     const txns =
