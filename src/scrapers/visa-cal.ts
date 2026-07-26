@@ -356,7 +356,19 @@ export function convertParsedDataToTransactions(
   // the API gives it no debit date of its own. Bill it on the account's real next debit date - the
   // same cycle its amount is already folded into - rather than its purchase date, which would
   // otherwise mint a separate, spurious forecast event on the purchase day.
-  const nextDebitMoment = nextDebitDate ? moment(nextDebitDate) : null;
+  //
+  // Prefer the next-debit date the caller derived from the frames endpoint. Some cards' frames omit
+  // it entirely (no `nextDebitDate`, no `nextTotalDebitDateForAccount`), so fall back to the card's
+  // own billing schedule: `debitDates[].date` lists its real debit dates, and the earliest one on or
+  // after a charge's purchase is the cycle it will post in. The purchase date is only the last resort.
+  const passedNextDebit = nextDebitDate ? moment(nextDebitDate) : null;
+  const scheduledDebitDates = [...regularDebitDays, ...immediateDebitDays]
+    .map(debitDate => debitDate.date)
+    .filter((date): date is string => Boolean(date))
+    .map(date => moment(date))
+    .sort((a, b) => a.valueOf() - b.valueOf());
+  const pendingDebitDate = (purchase: moment.Moment): moment.Moment =>
+    passedNextDebit ?? scheduledDebitDates.find(debit => !debit.isBefore(purchase, 'day')) ?? purchase;
 
   return all.map(transaction => {
     const numOfPayments = isPending(transaction) ? transaction.numberOfPayments : transaction.numOfPayments;
@@ -380,7 +392,7 @@ export function convertParsedDataToTransactions(
       status: isPending(transaction) ? TransactionStatuses.Pending : TransactionStatuses.Completed,
       date: installments ? date.add(installments.number - 1, 'month').toISOString() : date.toISOString(),
       processedDate: isPending(transaction)
-        ? (nextDebitMoment ?? date).toISOString()
+        ? pendingDebitDate(moment(transaction.trnPurchaseDate)).toISOString()
         : new Date(transaction.debCrdDate).toISOString(),
       originalAmount,
       originalCurrency: transaction.trnCurrencySymbol,
