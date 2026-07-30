@@ -39,10 +39,15 @@ const TRANSACTIONS_LIST_URL = `${WEB_BASE}/ocp/transactions/DigitalV3.Transactio
 const CARD_LIST_MARKER = 'GetCardList';
 
 export const AMEX_COMPANY_CODE = 77;
+export const ISRACARD_COMPANY_CODE = 11;
 const INSTALLMENTS_KEYWORD = 'תשלום';
 const ALT_SHEKEL = 'ש"ח';
 const RATE_LIMIT_MS = 1500;
 const ROSTER_TIMEOUT_MS = 30000;
+// A standing-order (הוראת קבע) voucher that hasn't been finalized yet can report its *original
+// authorization date* instead of this cycle's actual charge date - seen a full year stale in
+// production. Anything further than this from the cycle's charge date is treated as unreliable.
+const PLAUSIBLE_DATE_WINDOW_DAYS = 45;
 
 interface DigitalVoucher {
   purchaseDate?: string; // DD/MM/YYYY
@@ -54,6 +59,22 @@ interface DigitalVoucher {
   originalCurrencyIso?: string;
   moreInfo?: string;
   voucherNumber?: number | string;
+}
+
+// A transaction the issuer has approved (funds authorized with the merchant) but not yet posted
+// to a billing cycle - distinct from `DigitalVoucher`, which is already attached to a cycle. Seen
+// under `data.approvals.approvedTransactions` in `GetTransactionsList`'s response. Foreign-currency
+// purchases can sit here for days while the exchange rate settles, so they're invisible to the
+// legacy `CardsTransactionsList` API (which only knows about cycle-attached transactions) until
+// they clear and get folded into a `DigitalVoucher` on a later fetch.
+interface ScrapedApproval {
+  purchaseDate?: string; // DD/MM/YYYY
+  businessName?: string;
+  ilsBillingAmount?: number;
+  originalAmount?: number;
+  currencyIso?: string;
+  confirmationNumber?: string | number;
+  clearedDescription?: string;
 }
 
 interface DigitalCard {
@@ -157,12 +178,28 @@ export function resolveProcessedMoment(monthMoment: Moment, billingDay: number |
 }
 
 /**
+ * Whether a purchase date is close enough to its billing cycle's charge date to be trusted. A
+ * standing-order voucher still awaiting its first real charge can report the date its recurring
+ * authorization was *originally set up*, sometimes a full year earlier, instead of this cycle's
+ * purchase date - trusting it would hash the transaction into the wrong calendar day.
+ */
+function isPlausiblePurchaseDate(purchaseMoment: Moment, referenceMoment: Moment): boolean {
+  return Math.abs(purchaseMoment.diff(referenceMoment, 'days')) <= PLAUSIBLE_DATE_WINDOW_DAYS;
+}
+
+/**
  * Maps one DigitalV3 voucher to the shared `Transaction` shape, mirroring the legacy
  * Isracard/Amex mapping: amounts are negated (outflows are negative), `date` is the purchase
  * date (matching what the bank UI shows), `chargedAmount` is the amount billed this cycle while
  * `originalAmount` is the full deal amount, and installments are parsed from the Hebrew memo.
  * `processedMoment` is the card's real charge date for this billing cycle (see
  * `resolveProcessedMoment`), not just the 1st of the billing month.
+ *
+ * When `purchaseDate` is missing or implausibly far from `processedMoment` (see
+ * `isPlausiblePurchaseDate`), the voucher is treated as not yet finalized: `date` falls back to
+ * one month before the charge date (this cycle's typical purchase-to-charge lag) and `status`
+ * becomes `Pending` rather than `Completed`. Once the real date is reported on a later scrape, the
+ * transaction hash changes and the stand-in row is reconciled away like any other pending charge.
  */
 export function voucherToTransaction(voucher: DigitalVoucher, processedMoment: Moment): Transaction | null {
   if (!voucher.purchaseDate) {
@@ -171,10 +208,13 @@ export function voucherToTransaction(voucher: DigitalVoucher, processedMoment: M
   const installments = getInstallments(voucher.moreInfo);
   const billed = voucher.billingAmount ?? voucher.ilsAmount ?? 0;
   const original = voucher.originalAmount ?? billed;
+  const purchaseMoment = moment(voucher.purchaseDate, 'DD/MM/YYYY');
+  const plausible = isPlausiblePurchaseDate(purchaseMoment, processedMoment);
+  const dateMoment = plausible ? purchaseMoment : processedMoment.clone().subtract(1, 'month');
   return {
     type: installments ? TransactionTypes.Installments : TransactionTypes.Normal,
     identifier: voucher.voucherNumber,
-    date: moment(voucher.purchaseDate, 'DD/MM/YYYY').toISOString(),
+    date: dateMoment.toISOString(),
     processedDate: processedMoment.clone().toISOString(),
     originalAmount: -original,
     originalCurrency: normalizeCurrency(voucher.originalCurrencyIso ?? voucher.originalCurrency),
@@ -183,10 +223,48 @@ export function voucherToTransaction(voucher: DigitalVoucher, processedMoment: M
     description: voucher.businessName ?? '',
     memo: voucher.moreInfo?.trim() || '',
     installments,
-    status: TransactionStatuses.Completed,
+    status: plausible ? TransactionStatuses.Completed : TransactionStatuses.Pending,
   };
 }
 
+/**
+ * Maps one `data.approvals.approvedTransactions` entry (approved but not yet posted to any
+ * billing cycle - see `ScrapedApproval`) to the shared `Transaction` shape. Always `Pending`: by
+ * definition these haven't cleared yet. `purchaseDate` is usually reliable here (unlike a stale
+ * standing-order voucher), but gets the same plausibility fallback for safety.
+ */
+export function approvalToTransaction(approval: ScrapedApproval, processedMoment: Moment): Transaction | null {
+  if (!approval.purchaseDate) {
+    return null;
+  }
+  const purchaseMoment = moment(approval.purchaseDate, 'DD/MM/YYYY');
+  const dateMoment = isPlausiblePurchaseDate(purchaseMoment, processedMoment)
+    ? purchaseMoment
+    : processedMoment.clone().subtract(1, 'month');
+  const billed = approval.ilsBillingAmount ?? 0;
+  const original = approval.originalAmount ?? billed;
+  return {
+    type: TransactionTypes.Normal,
+    identifier: approval.confirmationNumber,
+    date: dateMoment.toISOString(),
+    processedDate: processedMoment.clone().toISOString(),
+    originalAmount: -original,
+    originalCurrency: normalizeCurrency(approval.currencyIso),
+    chargedAmount: -billed,
+    chargedCurrency: 'ILS',
+    description: approval.businessName ?? '',
+    memo: approval.clearedDescription?.trim() || '',
+    status: TransactionStatuses.Pending,
+  };
+}
+
+/**
+ * Fetches one card's transactions for one billing cycle: vouchers already attached to the cycle
+ * (`israelAbroadVouchers`, via `voucherToTransaction`) plus anything still awaiting clearance
+ * (`approvals.approvedTransactions`, via `approvalToTransaction` - always `Pending`). The legacy
+ * `CardsTransactionsList` API has no equivalent for the latter, so it's invisible to a card whose
+ * primary history comes from there until it clears and becomes an ordinary voucher.
+ */
 async function fetchCardMonth(page: Page, card: DigitalCard, monthMoment: Moment): Promise<Transaction[]> {
   const billingMonth = monthMoment.clone().date(1).format('DD/MM/YYYY');
   const body = {
@@ -199,27 +277,27 @@ async function fetchCardMonth(page: Page, card: DigitalCard, monthMoment: Moment
   };
   const result = await fetchPostWithinPage<{
     isSuccess?: boolean;
-    data?: { israelAbroadVouchers?: { vouchers?: { israelAbroadVouchersList?: DigitalVoucher[] } } };
+    data?: {
+      israelAbroadVouchers?: { vouchers?: { israelAbroadVouchersList?: DigitalVoucher[] } };
+      approvals?: { approvedTransactions?: ScrapedApproval[] };
+    };
   }>(page, TRANSACTIONS_LIST_URL, body, { 'Content-Type': 'application/json' }, true);
 
   const vouchers = result?.data?.israelAbroadVouchers?.vouchers?.israelAbroadVouchersList ?? [];
+  const approvals = result?.data?.approvals?.approvedTransactions ?? [];
   const processedMoment = resolveProcessedMoment(monthMoment, card.billingDay);
-  return vouchers
-    .map(voucher => voucherToTransaction(voucher, processedMoment))
-    .filter((txn): txn is Transaction => txn !== null);
+  const voucherTxns = vouchers.map(voucher => voucherToTransaction(voucher, processedMoment));
+  const approvalTxns = approvals.map(approval => approvalToTransaction(approval, processedMoment));
+  return [...voucherTxns, ...approvalTxns].filter((txn): txn is Transaction => txn !== null);
 }
 
 /**
- * Discovers the logged-in user's Amex cards (issuer company code 77) via the DigitalV3 roster,
- * then returns one `TransactionsAccount` per card with transactions across the month window.
- * Never throws for a "no Amex cards" situation — it just returns `[]` — so a caller can safely
- * append the result to a normal Isracard scrape.
+ * Navigates to the DigitalV3 transactions page and discovers every card the logged-in session can
+ * see (both Isracard's own cards and any Amex cards riding on the same login), by intercepting the
+ * SPA's own `GetCardList` roster response. Returns `[]` (never throws) if the roster can't be
+ * read, so a caller can safely treat this as best-effort.
  */
-export async function fetchAmexAccountsViaDigital(
-  page: Page,
-  startMoment: Moment,
-  futureMonths: number,
-): Promise<TransactionsAccount[]> {
+async function discoverDigitalV3Cards(page: Page): Promise<DigitalCard[]> {
   debug('navigating to DigitalV3 transactions page to discover cards');
   const rosterPromise = page
     .waitForResponse(response => response.url().includes(CARD_LIST_MARKER), { timeout: ROSTER_TIMEOUT_MS })
@@ -228,7 +306,7 @@ export async function fetchAmexAccountsViaDigital(
 
   const rosterResponse = await rosterPromise;
   if (!rosterResponse) {
-    debug('did not observe a GetCardList response; no Amex cards discovered');
+    debug('did not observe a GetCardList response; no cards discovered');
     return [];
   }
 
@@ -242,6 +320,21 @@ export async function fetchAmexAccountsViaDigital(
 
   const allCards = dedupeCards(collectCards(roster));
   debug(`roster cards: ${allCards.map(c => `${c.cardSuffix}(cc=${c.companyCode},st=${c.cardStatus})`).join(', ') || '(none)'}`);
+  return allCards;
+}
+
+/**
+ * Discovers the logged-in user's Amex cards (issuer company code 77) via the DigitalV3 roster,
+ * then returns one `TransactionsAccount` per card with transactions across the month window.
+ * Never throws for a "no Amex cards" situation — it just returns `[]` — so a caller can safely
+ * append the result to a normal Isracard scrape.
+ */
+export async function fetchAmexAccountsViaDigital(
+  page: Page,
+  startMoment: Moment,
+  futureMonths: number,
+): Promise<TransactionsAccount[]> {
+  const allCards = await discoverDigitalV3Cards(page);
   const amexCards = allCards.filter(card => card.companyCode === AMEX_COMPANY_CODE && card.cardStatus === 0);
   debug(`discovered ${amexCards.length} active Amex card(s): ${amexCards.map(c => c.cardSuffix).join(', ') || '(none)'}`);
   if (amexCards.length === 0) {
@@ -258,6 +351,47 @@ export async function fetchAmexAccountsViaDigital(
     }
     debug(`Amex card ${card.cardSuffix}: ${txns.length} transaction(s) across ${months.length} month(s)`);
     accounts.push({ accountNumber: card.cardSuffix, companyCode: card.companyCode, txns });
+  }
+  return accounts;
+}
+
+/**
+ * Isracard's own cards (issuer company code 11) get their transaction history from the legacy
+ * `CardsTransactionsList` API (see `base-isracard-amex.ts`), which has no concept of a
+ * not-yet-cleared transaction. This supplements that history with just the signal the legacy API
+ * can't provide: transactions still `Pending` per `fetchCardMonth` - either genuinely not yet
+ * cleared (`approvals`) or a voucher whose date looks like a stale standing-order placeholder (see
+ * `isPlausiblePurchaseDate`). Everything else `fetchCardMonth` returns is deliberately dropped
+ * here, since the legacy API already covers it and re-adding it would double-count the same
+ * transaction under a fresh `occurrenceIndex`.
+ *
+ * Only looks at the last month through `futureMonths` ahead - not the full scrape history - since
+ * a transaction is only ever missing from the legacy API for its own still-open billing cycle.
+ * Returns one `TransactionsAccount` per card (never throws), for the caller to merge into the
+ * matching legacy account by `accountNumber`.
+ */
+export async function fetchUpcomingChargesForIsracardCards(
+  page: Page,
+  futureMonths: number,
+): Promise<TransactionsAccount[]> {
+  const allCards = await discoverDigitalV3Cards(page);
+  const ownCards = allCards.filter(card => card.companyCode === ISRACARD_COMPANY_CODE && card.cardStatus === 0);
+  debug(`discovered ${ownCards.length} active Isracard card(s): ${ownCards.map(c => c.cardSuffix).join(', ') || '(none)'}`);
+  if (ownCards.length === 0) {
+    return [];
+  }
+
+  const months = getAllMonthMoments(moment().subtract(1, 'month'), futureMonths);
+  const accounts: TransactionsAccount[] = [];
+  for (const card of ownCards) {
+    const txns: Transaction[] = [];
+    for (const monthMoment of months) {
+      await randomDelay(RATE_LIMIT_MS, RATE_LIMIT_MS + 500);
+      const monthTxns = await fetchCardMonth(page, card, monthMoment);
+      txns.push(...monthTxns.filter(txn => txn.status === TransactionStatuses.Pending));
+    }
+    debug(`Isracard card ${card.cardSuffix}: ${txns.length} not-yet-cleared transaction(s) across ${months.length} month(s)`);
+    accounts.push({ accountNumber: card.cardSuffix, txns });
   }
   return accounts;
 }

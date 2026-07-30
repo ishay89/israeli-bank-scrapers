@@ -1,5 +1,11 @@
 import moment from 'moment';
-import { collectCards, resolveProcessedMoment, voucherToTransaction } from './isracard-amex-digital';
+import {
+  collectCards,
+  resolveProcessedMoment,
+  voucherToTransaction,
+  approvalToTransaction,
+} from './isracard-amex-digital';
+import { TransactionStatuses } from '../transactions';
 
 // Trimmed but real-shaped `GetCardList` roster response (card 1558, an Amex card whose upcoming
 // charge is 02/08/2026, per the bank's own UI - not the 1st of the month).
@@ -72,6 +78,60 @@ describe('voucherToTransaction', () => {
 
   test('returns null when the voucher has no purchase date', () => {
     const txn = voucherToTransaction({ businessName: 'test' }, moment('2026-08-02'));
+    expect(txn).toBeNull();
+  });
+
+  // Real production case: a standing-order (הוראת קבע) voucher reported its original
+  // authorization date - a full year before the cycle it was billed under - instead of an actual
+  // purchase date for this cycle.
+  test('falls back to a stand-in date and Pending status when the purchase date is implausibly stale', () => {
+    const processedMoment = resolveProcessedMoment(moment('2026-08-15'), 2);
+    const txn = voucherToTransaction(
+      { purchaseDate: '27/07/2025', businessName: 'ANTHROPIC* CLAUDE SUB', billingAmount: 61.16 },
+      processedMoment,
+    );
+    expect(txn).not.toBeNull();
+    expect(txn!.status).toBe(TransactionStatuses.Pending);
+    const date = moment(txn!.date);
+    expect(date.year()).toBe(2026);
+    expect(date.month()).toBe(6); // July, one month before the August charge date
+  });
+
+  test('trusts a purchase date within the plausible window and marks it Completed', () => {
+    const processedMoment = resolveProcessedMoment(moment('2026-08-15'), 2);
+    const txn = voucherToTransaction(
+      { purchaseDate: '27/07/2026', businessName: 'test', billingAmount: 50 },
+      processedMoment,
+    );
+    expect(txn!.status).toBe(TransactionStatuses.Completed);
+    expect(moment(txn!.date).format('DD/MM/YYYY')).toBe('27/07/2026');
+  });
+});
+
+describe('approvalToTransaction', () => {
+  test('maps an approved-but-not-yet-cleared transaction and always marks it Pending', () => {
+    const processedMoment = resolveProcessedMoment(moment('2026-08-15'), 2);
+    const txn = approvalToTransaction(
+      {
+        purchaseDate: '29/07/2026',
+        businessName: 'OPENAI *CHATGPT SUBSCR',
+        ilsBillingAmount: 61.16,
+        originalAmount: 20,
+        currencyIso: 'USD',
+        confirmationNumber: '10339013:19',
+      },
+      processedMoment,
+    );
+    expect(txn).not.toBeNull();
+    expect(txn!.status).toBe(TransactionStatuses.Pending);
+    expect(txn!.chargedAmount).toBe(-61.16);
+    expect(txn!.originalAmount).toBe(-20);
+    expect(txn!.originalCurrency).toBe('USD');
+    expect(moment(txn!.date).format('DD/MM/YYYY')).toBe('29/07/2026');
+  });
+
+  test('returns null when the approval has no purchase date', () => {
+    const txn = approvalToTransaction({ businessName: 'test' }, moment('2026-08-02'));
     expect(txn).toBeNull();
   });
 });
