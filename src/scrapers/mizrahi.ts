@@ -41,8 +41,9 @@ interface ScrapedTransactionsResult {
     messages: { text: string }[];
   };
   body: {
-    fields: {
-      Yitra: string;
+    // Absent on some accounts: the bank now serves the balance from Get428ODS instead.
+    fields?: {
+      Yitra?: string;
     };
     table: {
       rows: ScrapedTransaction[];
@@ -86,6 +87,10 @@ const TRANSACTIONS_REQUEST_URLS = [
 ];
 const PENDING_TRANSACTIONS_PAGE = '/osh/legacy/legacy-Osh-p420';
 const PENDING_TRANSACTIONS_IFRAME = 'p420.aspx';
+// The account-overview call the site fires when the transactions page opens. It carries the
+// balance as a display string (`itra.itra`) - and, for some accounts, is the only place it appears.
+const ACCOUNT_BALANCE_URL = /\/Online\/api\/osh\/get428ODS/i;
+const ACCOUNT_BALANCE_TIMEOUT = 15000;
 const MORE_DETAILS_URL = `${BASE_APP_URL}/Online/api/OSH/getMaherBerurimSMF`;
 const CHANGE_PASSWORD_URL = /https:\/\/www\.mizrahi-tefahot\.co\.il\/login\/index\.html#\/change-pass/;
 const DATE_FORMAT = 'DD/MM/YYYY';
@@ -274,6 +279,37 @@ async function extractPendingTransactions(page: Frame): Promise<Transaction[]> {
     }));
 }
 
+interface AccountBalanceResult {
+  itra?: {
+    itra?: string;
+    itra_date?: string;
+  };
+}
+
+/**
+ * Parses a Mizrahi display amount such as `1,234.56`, `-1,234.56`, `1,234.56-` or `₪ 1,234.56`.
+ * The minus sign may sit on either side, so it is detected anywhere rather than left to
+ * parseFloat. Returns undefined when there is no number at all, so a missing balance stays
+ * missing instead of becoming NaN (`+undefined`), which downstream JSON serializes as null.
+ */
+export function parseMizrahiAmount(value: string | number | null | undefined): number | undefined {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : undefined;
+  }
+  if (!value) {
+    return undefined;
+  }
+  const digits = value.replace(/[^\d.]/g, '');
+  if (!/\d/.test(digits)) {
+    return undefined;
+  }
+  const amount = parseFloat(digits);
+  if (!Number.isFinite(amount)) {
+    return undefined;
+  }
+  return value.includes('-') ? -amount : amount;
+}
+
 async function postLogin(page: Page) {
   await Promise.race([
     waitUntilElementFound(page, afterLoginSelector),
@@ -341,6 +377,12 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
   }
 
   private async fetchAccount() {
+    // Listen before navigating: the site fires this call itself as the transactions page opens.
+    const balanceResponse = this.page
+      .waitForResponse(res => ACCOUNT_BALANCE_URL.test(res.url()), { timeout: ACCOUNT_BALANCE_TIMEOUT })
+      .then(res => res.json() as Promise<{ body?: AccountBalanceResult }>)
+      .catch(() => undefined);
+
     await this.page.waitForSelector(`a[href*="${OSH_PAGE}"]`);
     await this.page.$eval(`a[href*="${OSH_PAGE}"]`, el => (el as HTMLElement).click());
     await waitUntilElementFound(this.page, `a[href*="${TRANSACTIONS_PAGE}"]`);
@@ -392,10 +434,16 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     const pendingTxn = await this.getPendingTransactions();
     const allTxn = oshTxnAfterStartDate.concat(pendingTxn);
 
+    const balance =
+      parseMizrahiAmount(response.body.fields?.Yitra) ?? parseMizrahiAmount((await balanceResponse)?.body?.itra?.itra);
+    if (balance === undefined) {
+      debug('Balance not found in the transactions response nor the account overview.');
+    }
+
     return {
       accountNumber,
       txns: allTxn,
-      balance: +response.body.fields?.Yitra,
+      balance,
     };
   }
 
