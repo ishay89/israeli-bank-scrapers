@@ -1,4 +1,4 @@
-import MizrahiScraper from './mizrahi';
+import MizrahiScraper, { parseMizrahiAmount } from './mizrahi';
 import { maybeTestCompanyAPI, extendAsyncTimeout, getTestsConfig, exportTransactions } from '../tests/tests-utils';
 import { SCRAPERS } from '../definitions';
 import { ISO_DATE_REGEX } from '../constants';
@@ -15,6 +15,21 @@ const testsConfig = getTestsConfig();
 describe('Mizrahi scraper', () => {
   beforeAll(() => {
     extendAsyncTimeout(); // The default timeout is 5 seconds per async test, this function extends the timeout value
+  });
+
+  test.each([
+    ['1,234.56', 1234.56],
+    ['-1,234.56', -1234.56],
+    ['1,234.56-', -1234.56],
+    ['₪ 12,000.00', 12000],
+    ['0.00', 0],
+    [' 5 ', 5],
+  ])('parseMizrahiAmount(%p) -> %p', (input, expected) => {
+    expect(parseMizrahiAmount(input)).toBe(expected);
+  });
+
+  test.each([[undefined], [null], [''], ['--'], ['₪'], [NaN]])('parseMizrahiAmount(%p) -> undefined', input => {
+    expect(parseMizrahiAmount(input)).toBeUndefined();
   });
 
   test('should expose login fields in scrapers constant', () => {
