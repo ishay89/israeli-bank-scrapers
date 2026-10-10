@@ -1,4 +1,4 @@
-import MizrahiScraper, { parseMizrahiAmount } from './mizrahi';
+import MizrahiScraper, { convertPendingRow, parseAmount, parseMizrahiAmount } from './mizrahi';
 import { maybeTestCompanyAPI, extendAsyncTimeout, getTestsConfig, exportTransactions } from '../tests/tests-utils';
 import { SCRAPERS } from '../definitions';
 import { ISO_DATE_REGEX } from '../constants';
@@ -31,6 +31,7 @@ describe('Mizrahi scraper', () => {
   test.each([[undefined], [null], [''], ['--'], ['₪'], [NaN]])('parseMizrahiAmount(%p) -> undefined', input => {
     expect(parseMizrahiAmount(input)).toBeUndefined();
   });
+
 
   test('should expose login fields in scrapers constant', () => {
     expect(SCRAPERS.mizrahi).toBeDefined();
@@ -80,5 +81,138 @@ describe('Mizrahi scraper', () => {
     expect(account.txns[0].date).toMatch(ISO_DATE_REGEX);
 
     exportTransactions(COMPANY_ID, result.accounts || []);
+  });
+});
+
+describe('parseAmount', () => {
+  test('parses an integer string', () => {
+    expect(parseAmount('12345')).toBe(12345);
+  });
+
+  test('parses a string with thousands separators', () => {
+    expect(parseAmount('12,345.67')).toBe(12345.67);
+  });
+
+  test('parses a negative value', () => {
+    expect(parseAmount('-1,234.5')).toBe(-1234.5);
+  });
+
+  test('strips a leading currency symbol', () => {
+    expect(parseAmount('₪1,234.5')).toBe(1234.5);
+  });
+
+  test('strips a trailing currency symbol', () => {
+    expect(parseAmount('1,234.5 ₪')).toBe(1234.5);
+  });
+
+  test('returns undefined for an empty string', () => {
+    expect(parseAmount('')).toBeUndefined();
+  });
+
+  test('returns undefined for undefined', () => {
+    expect(parseAmount(undefined)).toBeUndefined();
+  });
+
+  test('returns undefined for null', () => {
+    expect(parseAmount(null)).toBeUndefined();
+  });
+
+  test('returns undefined for garbage input', () => {
+    expect(parseAmount('abc')).toBeUndefined();
+  });
+
+  test('applies the sign for a trailing minus', () => {
+    expect(parseAmount('1,234.56-')).toBe(-1234.56);
+  });
+
+  test('applies the sign for parenthesized negatives', () => {
+    expect(parseAmount('(1,234.56)')).toBe(-1234.56);
+  });
+
+  test('applies the sign for a leading minus with a thousands separator', () => {
+    expect(parseAmount('-1,234.56')).toBe(-1234.56);
+  });
+
+  test('strips bidi marks around the amount', () => {
+    expect(parseAmount('‏1,234.56‎')).toBe(1234.56);
+  });
+
+  test('returns undefined for a lone minus sign', () => {
+    expect(parseAmount('-')).toBeUndefined();
+  });
+
+  test('returns undefined for whitespace-only input', () => {
+    expect(parseAmount('   ')).toBeUndefined();
+  });
+
+  test('returns undefined for a minus sign embedded in letters', () => {
+    expect(parseAmount('abc-5')).toBeUndefined();
+  });
+
+  test('returns undefined for a minus sign embedded between digits', () => {
+    expect(parseAmount('12-34')).toBeUndefined();
+  });
+
+  test('returns undefined for a value with multiple decimal points', () => {
+    expect(parseAmount('1.2.3')).toBeUndefined();
+  });
+
+  test('returns undefined for exponential notation', () => {
+    expect(parseAmount('1e5')).toBeUndefined();
+  });
+
+  test('parses a leading-dot decimal', () => {
+    expect(parseAmount('.5')).toBe(0.5);
+  });
+
+  test('parses a realistic Yitra-like balance string', () => {
+    expect(parseAmount('12,345.67 ₪')).toBe(12345.67);
+  });
+
+  test('strips a leading currency symbol with a leading minus', () => {
+    expect(parseAmount('₪ -12')).toBe(-12);
+  });
+
+  test('strips a trailing currency symbol with a trailing minus', () => {
+    expect(parseAmount('12- ₪')).toBe(-12);
+  });
+
+  test('maps a unicode minus sign after the amount', () => {
+    expect(parseAmount('1,234.56−')).toBe(-1234.56);
+  });
+
+  test('returns undefined for Hebrew text preceding the amount', () => {
+    expect(parseAmount('יתרת חובה 1,234.56')).toBeUndefined();
+  });
+
+  test('returns undefined for Hebrew text following the amount', () => {
+    expect(parseAmount('1,234.56 חובה')).toBeUndefined();
+  });
+
+  test('returns undefined for multiple parenthesized groups', () => {
+    expect(parseAmount('(1)+(2)')).toBeUndefined();
+  });
+});
+
+describe('convertPendingRow', () => {
+  test('parses a debit row as a negative amount', () => {
+    const txn = convertPendingRow(['15/09/26', 'חיוב ויזה כאל עתידי', "ש''ח", '', '6,883.17', '1', '002', '']);
+    expect(txn?.chargedAmount).toBe(-6883.17);
+    expect(txn?.status).toBe('pending');
+  });
+
+  test('parses a credit row as a positive amount', () => {
+    const txn = convertPendingRow(['10/09/26', 'desc', "ש''ח", '250.00', '', '1', '001', '']);
+    expect(txn?.chargedAmount).toBe(250);
+  });
+
+  test('returns undefined for a row with an empty date', () => {
+    const txn = convertPendingRow(['', 'desc', "ש''ח", '', '6,883.17', '1', '002', '']);
+    expect(txn).toBeUndefined();
+  });
+
+  test('returns undefined for a row with no parsable amount', () => {
+    const txn = convertPendingRow(['15/09/26', 'desc', "ש''ח", '', '', '1', '002', '']);
+    expect(txn).toBeUndefined();
   });
 });

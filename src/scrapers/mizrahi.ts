@@ -254,29 +254,77 @@ async function convertTransactions(
   );
 }
 
+const STRIP_REGEX = /[,\s\u20aa$\u20ac\u200e\u200f\u202a-\u202e]/g;
+const PAREN_REGEX = /^\((.+)\)$/;
+const UNSIGNED_AMOUNT_REGEX = /^\d*\.?\d+$/;
+
+export function parseAmount(raw: string | undefined | null): number | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  const cleaned = raw.replace(STRIP_REGEX, '').replace(/\u2212/g, '-');
+  if (!cleaned) {
+    return undefined;
+  }
+
+  const parenMatch = cleaned.match(PAREN_REGEX);
+  let unsigned = cleaned;
+  let isNegative = false;
+  if (parenMatch) {
+    isNegative = true;
+    unsigned = parenMatch[1];
+  } else if (cleaned.startsWith('-')) {
+    isNegative = true;
+    unsigned = cleaned.slice(1);
+  } else if (cleaned.endsWith('-')) {
+    isNegative = true;
+    unsigned = cleaned.slice(0, -1);
+  }
+
+  if (!UNSIGNED_AMOUNT_REGEX.test(unsigned)) {
+    return undefined;
+  }
+
+  const value = parseFloat(unsigned);
+  return isNegative ? -value : value;
+}
+
+export function convertPendingRow(cells: string[]): Transaction | undefined {
+  const [dateStr, description, , creditStr, debitStr] = cells;
+  const date = moment(dateStr, 'DD/MM/YY').toISOString();
+  const debit = parseAmount(debitStr);
+  const credit = parseAmount(creditStr);
+  const amount = debit !== undefined ? -debit : credit;
+
+  if (!date || amount === undefined) {
+    debug(
+      `Dropping pending transaction with unparsable date or amount. dateStr: ${dateStr}, description: ${description}, creditStr: ${creditStr}, debitStr: ${debitStr}`,
+    );
+    return undefined;
+  }
+
+  return {
+    type: TransactionTypes.Normal,
+    date,
+    processedDate: date,
+    originalAmount: amount,
+    originalCurrency: SHEKEL_CURRENCY,
+    chargedAmount: amount,
+    description,
+    status: TransactionStatuses.Pending,
+  };
+}
+
 async function extractPendingTransactions(page: Frame): Promise<Transaction[]> {
   const pendingTxn = await pageEvalAll(page, 'tr.rgRow, tr.rgAltRow', [], trs => {
     return trs.map(tr => Array.from(tr.querySelectorAll('td'), td => td.textContent || ''));
   });
 
-  return pendingTxn
-    .map(([dateStr, description, incomeAmountStr, amountStr]) => ({
-      date: moment(dateStr, 'DD/MM/YY').toISOString(),
-      amount: parseFloat(amountStr.replaceAll(',', '')),
-      description,
-      incomeAmountStr, // TODO: handle incomeAmountStr once we know the sign of it
-    }))
-    .filter(txn => txn.date)
-    .map(({ date, description, amount }) => ({
-      type: TransactionTypes.Normal,
-      date,
-      processedDate: date,
-      originalAmount: amount,
-      originalCurrency: SHEKEL_CURRENCY,
-      chargedAmount: amount,
-      description,
-      status: TransactionStatuses.Pending,
-    }));
+  return pendingTxn.flatMap(cells => {
+    const txn = convertPendingRow(cells);
+    return txn ? [txn] : [];
+  });
 }
 
 interface AccountBalanceResult {
