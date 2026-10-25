@@ -434,6 +434,13 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     await this.page.waitForSelector(`a[href*="${OSH_PAGE}"]`);
     await this.page.$eval(`a[href*="${OSH_PAGE}"]`, el => (el as HTMLElement).click());
     await waitUntilElementFound(this.page, `a[href*="${TRANSACTIONS_PAGE}"]`);
+    // Listen before clicking, for the same reason as above: on a loaded machine the page can fire this call
+    // before the account-number lookup below finishes, and a listener attached after that misses it.
+    const transactionsRequest = Promise.any(
+      TRANSACTIONS_REQUEST_URLS.map(async url => [url, await this.page.waitForRequest(url)] as const),
+    );
+    // Keep an early throw below from leaving this rejection unhandled; it is still awaited further down.
+    transactionsRequest.catch(() => undefined);
     await this.page.$eval(`a[href*="${TRANSACTIONS_PAGE}"]`, el => (el as HTMLElement).click());
 
     const accountNumberElement = await this.page.$('#dropdownBasic b span');
@@ -443,15 +450,10 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       throw new Error('Account number not found');
     }
 
-    const [response, apiHeaders] = await Promise.any(
-      TRANSACTIONS_REQUEST_URLS.map(async url => {
-        const request = await this.page.waitForRequest(url);
-        const data = createDataFromRequest(request, this.options.startDate);
-        const headers = createHeadersFromRequest(request);
-
-        return [await fetchPostWithinPage<ScrapedTransactionsResult>(this.page, url, data, headers), headers] as const;
-      }),
-    );
+    const [url, request] = await transactionsRequest;
+    const data = createDataFromRequest(request, this.options.startDate);
+    const apiHeaders = createHeadersFromRequest(request);
+    const response = await fetchPostWithinPage<ScrapedTransactionsResult>(this.page, url, data, apiHeaders);
 
     if (!response || response.header.success === false) {
       throw new Error(
