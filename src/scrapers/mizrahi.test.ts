@@ -1,4 +1,11 @@
-import MizrahiScraper, { convertPendingRow, parseAmount, parseMizrahiAmount } from './mizrahi';
+import MizrahiScraper, {
+  convertMizrahiLoans,
+  convertPendingRow,
+  type LoanGrid,
+  nextScheduledPayment,
+  parseAmount,
+  parseMizrahiAmount,
+} from './mizrahi';
 import { maybeTestCompanyAPI, extendAsyncTimeout, getTestsConfig, exportTransactions } from '../tests/tests-utils';
 import { SCRAPERS } from '../definitions';
 import { ISO_DATE_REGEX } from '../constants';
@@ -31,7 +38,6 @@ describe('Mizrahi scraper', () => {
   test.each([[undefined], [null], [''], ['--'], ['₪'], [NaN]])('parseMizrahiAmount(%p) -> undefined', input => {
     expect(parseMizrahiAmount(input)).toBeUndefined();
   });
-
 
   test('should expose login fields in scrapers constant', () => {
     expect(SCRAPERS.mizrahi).toBeDefined();
@@ -214,5 +220,88 @@ describe('convertPendingRow', () => {
   test('returns undefined for a row with no parsable amount', () => {
     const txn = convertPendingRow(['15/09/26', 'desc', "ש''ח", '', '', '1', '002', '']);
     expect(txn).toBeUndefined();
+  });
+});
+
+// Visible columns of the live P060.aspx grid (hidden rate-breakdown columns already dropped).
+const LOANS_GRID: LoanGrid = {
+  headers: [
+    'מספר הלוואה',
+    'סוג הלוואה',
+    'תאריך ערך',
+    'תאריך סיום',
+    '% ריבית',
+    'סכום הלוואה מקורי',
+    'יתרה משוערכת',
+    'מטרת הלוואה',
+    '\u00a0',
+  ],
+  rows: [
+    [
+      '628401',
+      'הצט.מנהלים קצר',
+      '\u00a0 \n 11/10/26',
+      '22/10/31',
+      '7.75',
+      ' 40,000.00',
+      ' 40,111.94',
+      'צריכה שוטפת של משק ה',
+      'לוח סילוקין',
+    ],
+  ],
+};
+
+describe('convertMizrahiLoans', () => {
+  test('converts a shekel loan row', () => {
+    expect(convertMizrahiLoans(LOANS_GRID, '493-325673')).toEqual([
+      {
+        sourceAccountNumber: '493-325673',
+        externalId: '628401',
+        type: 'loan',
+        name: 'הצט.מנהלים קצר',
+        currency: 'ILS',
+        originalAmount: 40000,
+        outstandingBalance: 40111.94,
+        interestRate: 7.75,
+      },
+    ]);
+  });
+
+  test('returns no loans for a grid without rows', () => {
+    expect(convertMizrahiLoans({ ...LOANS_GRID, rows: [] }, '1')).toEqual([]);
+  });
+
+  test('throws when the layout lost an identifying column', () => {
+    const headers = LOANS_GRID.headers.map(h => (h === 'יתרה משוערכת' ? 'יתרה' : h));
+    expect(() => convertMizrahiLoans({ ...LOANS_GRID, headers }, '1')).toThrow(/יתרה משוערכת/);
+  });
+});
+
+describe('nextScheduledPayment', () => {
+  const schedule: LoanGrid = {
+    headers: ['מספר תשלום', 'תאריך חיוב', 'תשלום על חשבון הקרן', 'תשלום על חשבון הריבית', 'סך החזר חודשי', 'יתרת הקרן'],
+    rows: [
+      ['1', '22/11/26', '547.95', '353.05', '901.00', '39,452.05'],
+      ['2', '22/12/26', '551.48', '254.80', '806.28', '38,900.57'],
+    ],
+  };
+
+  test('returns the first payment on or after today', () => {
+    expect(nextScheduledPayment(schedule, new Date(2026, 9, 25))).toEqual({
+      nextPaymentAmount: 901,
+      nextPaymentDate: '2026-11-22',
+    });
+  });
+
+  test('counts a payment due today as the next one', () => {
+    expect(nextScheduledPayment(schedule, new Date(2026, 10, 22, 15))?.nextPaymentDate).toBe('2026-11-22');
+  });
+
+  test('skips payments already charged', () => {
+    expect(nextScheduledPayment(schedule, new Date(2026, 10, 23))?.nextPaymentAmount).toBe(806.28);
+  });
+
+  test('returns undefined when the page holds no upcoming payment', () => {
+    expect(nextScheduledPayment(schedule, new Date(2027, 0, 1))).toBeUndefined();
   });
 });
