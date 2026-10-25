@@ -14,7 +14,7 @@ import { BaseScraperWithBrowser, LoginResults, type PossibleLoginResults } from 
 import { ScraperErrorTypes } from './errors';
 import { getDebug } from '../helpers/debug';
 import { getRawTransaction } from '../helpers/transactions';
-import { type ScraperOptions } from './interface';
+import { type DebtObligation, type ScraperOptions } from './interface';
 
 const debug = getDebug('mizrahi');
 
@@ -92,6 +92,14 @@ const PENDING_TRANSACTIONS_IFRAME = 'p420.aspx';
 const ACCOUNT_BALANCE_URL = /\/Online\/api\/osh\/get428ODS/i;
 const ACCOUNT_BALANCE_TIMEOUT = 15000;
 const MORE_DETAILS_URL = `${BASE_APP_URL}/Online/api/OSH/getMaherBerurimSMF`;
+// Shekel loans have no JSON API: the "loans and mortgages" menu opens a server-rendered P060.aspx
+// grid in an iframe, and each loan's amortization schedule is a P512.aspx grid of the same kind.
+const LOANS_MENU_PAGE = '/mashkanta/legacy/root-main-mashkanta-mash';
+const SHEKEL_LOANS_PAGE = '/mashkanta/legacy/legacy-Loan-P060';
+const SHEKEL_LOANS_IFRAME = '/Loan/P060.aspx';
+const LOAN_SCHEDULE_URL = `${BASE_APP_URL}/Online/Loan/P512.aspx`;
+const LOAN_GRID_SELECTOR = 'table.rgMasterTable';
+const LOAN_DATE_FORMAT = 'DD/MM/YY';
 const CHANGE_PASSWORD_URL = /https:\/\/www\.mizrahi-tefahot\.co\.il\/login\/index\.html#\/change(?:-pass|\/pass-he)$/;
 const DATE_FORMAT = 'DD/MM/YYYY';
 const MAX_ROWS_PER_REQUEST = 10000000000;
@@ -358,6 +366,90 @@ export function parseMizrahiAmount(value: string | number | null | undefined): n
   return value.includes('-') ? -amount : amount;
 }
 
+/** The visible headers and cells of a Telerik RadGrid; hidden (display:none) columns are dropped. */
+export interface LoanGrid {
+  headers: string[];
+  rows: string[][];
+}
+
+function gridColumn(grid: LoanGrid, header: string): number {
+  return grid.headers.findIndex(h => h.replace(/\s+/g, ' ').trim() === header);
+}
+
+function gridCell(grid: LoanGrid, row: string[], header: string): string | undefined {
+  const index = gridColumn(grid, header);
+  return index < 0 ? undefined : row[index]?.replace(/\s+/g, ' ').trim();
+}
+
+function parseLoanDate(value: string | undefined): moment.Moment | undefined {
+  const parsed = moment(value, LOAN_DATE_FORMAT, true);
+  return parsed.isValid() ? parsed : undefined;
+}
+
+/**
+ * Converts the P060 shekel-loans grid. Throws when the identifying columns are missing, so a
+ * changed layout reads as "loans unavailable" (preserve last-known rows) rather than "no loans".
+ */
+export function convertMizrahiLoans(grid: LoanGrid, sourceAccountNumber: string): DebtObligation[] {
+  for (const header of ['מספר הלוואה', 'יתרה משוערכת']) {
+    if (gridColumn(grid, header) < 0) {
+      throw new Error(`Mizrahi loans grid is missing the '${header}' column`);
+    }
+  }
+  return grid.rows.flatMap(row => {
+    const externalId = gridCell(grid, row, 'מספר הלוואה');
+    if (!externalId) {
+      return [];
+    }
+    return [
+      {
+        sourceAccountNumber,
+        externalId,
+        type: 'loan' as const,
+        name: gridCell(grid, row, 'סוג הלוואה') || `הלוואה ${externalId}`,
+        currency: SHEKEL_CURRENCY,
+        originalAmount: parseMizrahiAmount(gridCell(grid, row, 'סכום הלוואה מקורי')),
+        outstandingBalance: parseMizrahiAmount(gridCell(grid, row, 'יתרה משוערכת')),
+        interestRate: parseMizrahiAmount(gridCell(grid, row, '% ריבית')),
+      },
+    ];
+  });
+}
+
+/**
+ * Finds the first payment on or after `today` in a P512 amortization-schedule grid. The bank pages
+ * the schedule 50 rows at a time and only the first page is read, so a loan more than 50 payments
+ * in has no upcoming row here and gets no next payment rather than a wrong one.
+ */
+export function nextScheduledPayment(
+  grid: LoanGrid,
+  today: Date,
+): { nextPaymentAmount: number; nextPaymentDate: string } | undefined {
+  const startOfToday = moment(today).startOf('day');
+  for (const row of grid.rows) {
+    const date = parseLoanDate(gridCell(grid, row, 'תאריך חיוב'));
+    const amount = parseMizrahiAmount(gridCell(grid, row, 'סך החזר חודשי'));
+    if (date && amount !== undefined && date.isSameOrAfter(startOfToday)) {
+      return { nextPaymentAmount: amount, nextPaymentDate: date.format('YYYY-MM-DD') };
+    }
+  }
+  return undefined;
+}
+
+async function extractLoanGrid(frame: Frame): Promise<LoanGrid> {
+  await waitUntilElementFound(frame, LOAN_GRID_SELECTOR);
+  return frame.$eval(LOAN_GRID_SELECTOR, table => ({
+    headers: Array.from(table.querySelectorAll('thead th.rgHeader'))
+      .filter(th => (th as HTMLElement).style.display !== 'none')
+      .map(th => th.textContent || ''),
+    rows: Array.from(table.querySelectorAll('tbody > tr.rgRow, tbody > tr.rgAltRow')).map(tr =>
+      Array.from(tr.children)
+        .filter(td => (td as HTMLElement).style.display !== 'none')
+        .map(td => td.textContent || ''),
+    ),
+  }));
+}
+
 async function postLogin(page: Page) {
   await Promise.race([
     waitUntilElementFound(page, afterLoginSelector),
@@ -387,6 +479,8 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     try {
       const results: TransactionsAccount[] = [];
+      const debts: DebtObligation[] = [];
+      let debtsAvailable = true;
 
       for (let i = 0; i < numOfAccounts; i += 1) {
         if (i > 0) {
@@ -394,12 +488,25 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
         }
 
         await this.page.$eval(`${accountDropDownItemSelector}:nth-child(${i + 1})`, el => (el as HTMLElement).click());
-        results.push(await this.fetchAccount());
+        const account = await this.fetchAccount();
+        results.push(account);
+
+        // Loans are optional: a failure here must not fail the account scrape, and reports
+        // `debts: undefined` (keep last-known rows) rather than `[]` (no loans).
+        if (debtsAvailable) {
+          try {
+            debts.push(...(await this.fetchLoans(account.accountNumber)));
+          } catch (e) {
+            debug(`Failed to fetch loans for account ${account.accountNumber}:`, e);
+            debtsAvailable = false;
+          }
+        }
       }
 
       return {
         success: true,
         accounts: results,
+        debts: debtsAvailable ? debts : undefined,
       };
     } catch (e) {
       return {
@@ -495,6 +602,25 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       txns: allTxn,
       balance,
     };
+  }
+
+  private async fetchLoans(accountNumber: string): Promise<DebtObligation[]> {
+    await this.page.$eval(`a[href*="${LOANS_MENU_PAGE}"]`, el => (el as HTMLElement).click());
+    await waitUntilElementFound(this.page, `a[href*="${SHEKEL_LOANS_PAGE}"]`);
+    await this.page.$eval(`a[href*="${SHEKEL_LOANS_PAGE}"]`, el => (el as HTMLElement).click());
+    const frame = await waitUntilIframeFound(this.page, f => f.url().includes(SHEKEL_LOANS_IFRAME));
+    const loans = convertMizrahiLoans(await extractLoanGrid(frame), accountNumber);
+
+    // The next payment is a nice-to-have: a schedule that fails to load leaves the loan without it.
+    for (const loan of loans) {
+      try {
+        await frame.goto(`${LOAN_SCHEDULE_URL}?misHalvaa=${encodeURIComponent(loan.externalId)}`);
+        Object.assign(loan, nextScheduledPayment(await extractLoanGrid(frame), new Date()));
+      } catch (e) {
+        debug(`Failed to fetch the payment schedule of loan ${loan.externalId}:`, e);
+      }
+    }
+    return loans;
   }
 
   private shouldMarkAsPending(txn: Transaction): boolean {
